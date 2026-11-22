@@ -2,23 +2,22 @@ name: Isolated Windows installer QA
 on:
   push:
     branches: [codex/windows-qa-1-1-1]
-permissions:
-  contents: read
+permissions: {}
 jobs:
   stock-installer:
     runs-on: windows-2025
     timeout-minutes: 15
     steps:
-      - name: Download exact draft installer
+      - name: Download exact published prerelease installer
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
-          $asset = 'repos/mewakinHub/mew-edit-download/releases/assets/779155288'
-          cmd.exe /d /c "gh api $asset -H ""Accept: application/octet-stream"" > ""$file"""
-          if ($LASTEXITCODE) { throw 'Draft asset could not be downloaded with contents:read.' }
+          $url = 'https://github.com/mewakinHub/mew-edit-download/releases/download/v1.1.1/MEW-EDIT-Setup-1.1.1.exe'
+          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/mewakinHub/mew-edit-download/releases/454466797'
+          $asset = @($release.assets | Where-Object id -eq 779155288)
+          if ($release.draft -or -not $release.prerelease -or $release.tag_name -ne 'v1.1.1' -or $asset.Count -ne 1 -or $asset[0].browser_download_url -ne $url -or $asset[0].size -ne 219414426 -or $asset[0].digest -ne 'sha256:2b6b2a186a541e4b2163ebdb3003e70c0580f0d7d8096b45340d75fd575313aa') { throw 'Unexpected prerelease metadata.' }
+          Invoke-WebRequest -Uri $url -OutFile $file
           if ((Get-Item -LiteralPath $file).Length -ne 219414426) { throw 'Unexpected asset size.' }
           if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA') { throw 'Unexpected asset digest.' }
           Write-Output 'Exact approved installer digest and size verified.'
