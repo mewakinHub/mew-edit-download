@@ -65,11 +65,11 @@ jobs:
             $files | ForEach-Object { Set-Content -LiteralPath $_ -Value 'synthetic fixture' }
             $hashes = @($files | ForEach-Object { (Get-FileHash $_).Hash })
             if (-not $app.CloseMainWindow() -or -not $app.WaitForExit(30000)) { throw 'Could not close the QA-only app normally.' }
-            $upgrade = Start-Process $newer -ArgumentList @('/S', '--updated') -Wait -PassThru
+            $upgrade = Start-Process $newer -ArgumentList @('/S', '--updated', '--force-run') -Wait -PassThru
             if ($upgrade.ExitCode -ne 0) { throw "Update NSIS exit $($upgrade.ExitCode)" }
             $newAsar = (Get-FileHash $asar).Hash
             if ($oldAsar -eq $newAsar -or $newAsar -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5' -or (Get-Item $exe).VersionInfo.ProductVersion -notmatch '^1\.1\.1(?:\.0)?$') { throw 'Exact upgrade did not replace old payload at the same custom install path.' }
-            Write-Output 'PASS exact published 1.1.0 to 1.1.1 NSIS /S --updated upgraded in place.'
+            Write-Output 'PASS exact published 1.1.0 to 1.1.1 NSIS /S --updated --force-run upgraded in place.'
             $app = Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Sort-Object StartTime | Select-Object -First 1
             $reopened = [bool]$app
             if (-not $app) { $app = Start-Process $exe -PassThru }
