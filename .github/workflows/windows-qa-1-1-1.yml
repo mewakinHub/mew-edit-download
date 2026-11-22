@@ -1,7 +1,7 @@
-name: Isolated Windows installer QA
+name: Isolated Windows updater handoff QA
 on:
   push:
-    branches: [codex/windows-qa-1-1-1]
+    branches: [codex/windows-qa-updater-handoff]
 permissions: {}
 jobs:
   stock-installer:
@@ -21,37 +21,64 @@ jobs:
           if ((Get-Item -LiteralPath $file).Length -ne 219414426) { throw 'Unexpected asset size.' }
           if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA') { throw 'Unexpected asset digest.' }
           Write-Output 'Exact approved installer digest and size verified.'
-      - name: Install offline in disposable runner and look for first window
+      - name: Verify published 1.1.0 and test the NSIS upgrade handoff
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
+          $older = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.0.exe'
+          $newer = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
+          $shaOld = '2B8539567638E0FBB81EFCD9831020E26058B47FFE54419AEB82DEF7A3EBF174'
+          $url = 'https://github.com/mewakinHub/mew-edit-download/releases/download/v1.1.0/MEW-EDIT-Setup-1.1.0.exe'
+          $meta = Invoke-RestMethod 'https://api.github.com/repos/mewakinHub/mew-edit-download/releases/tags/v1.1.0'
+          $asset = @($meta.assets | Where-Object id -eq 775664991)
+          if ($meta.draft -or $asset.Count -ne 1 -or $asset[0].browser_download_url -ne $url -or $asset[0].size -ne 219319334 -or $asset[0].digest -ne "sha256:$($shaOld.ToLowerInvariant())") { throw 'Unexpected 1.1.0 release metadata.' }
+          Invoke-WebRequest $url -OutFile $older
+          if ((Get-Item $older).Length -ne 219319334 -or (Get-FileHash $older).Hash -ne $shaOld) { throw 'Unexpected 1.1.0 bytes.' }
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
           $target = Join-Path $env:LOCALAPPDATA 'MEW-EDIT-QA'
           $exe = Join-Path $target 'MEW EDIT.exe'
-          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
+          $profile = Join-Path $env:APPDATA 'MEW EDIT'
+          $project = Join-Path $env:RUNNER_TEMP 'synthetic-mew-project'
+          $asar = Join-Path $target 'resources/app.asar'
           $rules = @()
-          try {
-            foreach ($program in @($file, $exe)) {
-              $rules += New-NetFirewallRule -DisplayName "MEW stock QA isolated process" -Direction Outbound -Action Block -Program $program -Profile Any
-            }
-            $install = Start-Process -FilePath $file -ArgumentList @('/S', "/D=$target") -PassThru -Wait
-            if ($install.ExitCode -ne 0) { throw "NSIS exit $($install.ExitCode)" }
-            if (-not (Test-Path -LiteralPath $exe)) { throw 'Installed executable missing from isolated destination.' }
-            $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
-            if ($version -notmatch '^1\.1\.1(?:\.0)?$') { throw "Unexpected installed product version $version" }
-            if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $target 'resources/app.asar')).Hash -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5') { throw 'Installed ASAR digest mismatch.' }
-            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows Server 2025 x64."
-            $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru
+          function Wait-MewWindow($process) {
             for ($i=0; $i -lt 45; $i++) {
+              $process.Refresh()
+              if ($process.HasExited) { throw 'App exited before first window.' }
+              if ($process.MainWindowHandle -ne 0 -and $process.MainWindowTitle -match 'MEW') { return }
               Start-Sleep -Seconds 1
-              $app.Refresh()
-              if ($app.HasExited) { throw "App exited before first window with code $($app.ExitCode)." }
-              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -match 'MEW') {
-                Write-Output 'PASS observed initial MEW EDIT window; no licence or live-service actions.'
-                return
-              }
             }
-            throw 'No initial MEW EDIT window observed within 45 seconds.'
+            throw 'App did not display its first window.'
+          }
+          try {
+            foreach ($program in @($older, $newer, $exe, (Join-Path $env:LOCALAPPDATA 'Programs/MEW EDIT/MEW EDIT.exe'))) {
+              $rules += New-NetFirewallRule -DisplayName 'MEW updater QA isolated process' -Direction Outbound -Action Block -Program $program -Profile Any
+            }
+            $first = Start-Process $older -ArgumentList @('/S', "/D=$target") -Wait -PassThru
+            if ($first.ExitCode -ne 0 -or (Get-Item $exe).VersionInfo.ProductVersion -notmatch '^1\.1\.0(?:\.0)?$') { throw '1.1.0 install failed.' }
+            $oldAsar = (Get-FileHash $asar).Hash
+            $app = Start-Process $exe -PassThru
+            Wait-MewWindow $app
+            if (-not (Test-Path $profile)) { throw 'Expected QA userData not created.' }
+            New-Item -ItemType Directory $project | Out-Null
+            $files = @((Join-Path $profile 'qa-userdata-sentinel.txt'), (Join-Path $project 'qa-project-sentinel.txt'))
+            $files | ForEach-Object { Set-Content -LiteralPath $_ -Value 'synthetic fixture' }
+            $hashes = @($files | ForEach-Object { (Get-FileHash $_).Hash })
+            if (-not $app.CloseMainWindow() -or -not $app.WaitForExit(30000)) { throw 'Could not close the QA-only app normally.' }
+            $upgrade = Start-Process $newer -ArgumentList @('/S', '--updated') -Wait -PassThru
+            if ($upgrade.ExitCode -ne 0) { throw "Update NSIS exit $($upgrade.ExitCode)" }
+            $newAsar = (Get-FileHash $asar).Hash
+            if ($oldAsar -eq $newAsar -or $newAsar -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5' -or (Get-Item $exe).VersionInfo.ProductVersion -notmatch '^1\.1\.1(?:\.0)?$') { throw 'Exact upgrade did not replace old payload at the same custom install path.' }
+            Write-Output 'PASS exact published 1.1.0 to 1.1.1 NSIS /S --updated upgraded in place.'
+            $app = Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Sort-Object StartTime | Select-Object -First 1
+            $reopened = [bool]$app
+            if (-not $app) { $app = Start-Process $exe -PassThru }
+            Wait-MewWindow $app
+            for ($i=0; $i -lt $files.Count; $i++) {
+              if ((Get-FileHash $files[$i]).Hash -ne $hashes[$i]) { throw 'Synthetic file changed across update.' }
+            }
+            Write-Output "PASS initial upgraded app window and both synthetic sentinels unchanged. Installer relaunched app: $reopened"
+            if (-not $reopened) { throw 'Stock installer required explicit launch; automatic updater relaunch contract did not hold.' }
           } finally {
             Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Stop-Process -Force
             $rules | Remove-NetFirewallRule
