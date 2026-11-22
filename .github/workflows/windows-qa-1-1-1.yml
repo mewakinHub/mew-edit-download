@@ -1,0 +1,59 @@
+name: Isolated Windows installer QA
+on:
+  push:
+    branches: [codex/windows-qa-1-1-1]
+permissions:
+  contents: read
+jobs:
+  stock-installer:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Download exact draft installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
+          $asset = 'repos/mewakinHub/mew-edit-download/releases/assets/779155288'
+          cmd.exe /d /c "gh api $asset -H ""Accept: application/octet-stream"" > ""$file"""
+          if ($LASTEXITCODE) { throw 'Draft asset could not be downloaded with contents:read.' }
+          if ((Get-Item -LiteralPath $file).Length -ne 219414426) { throw 'Unexpected asset size.' }
+          if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA') { throw 'Unexpected asset digest.' }
+          Write-Output 'Exact approved installer digest and size verified.'
+      - name: Install offline in disposable runner and look for first window
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
+          $target = Join-Path $env:LOCALAPPDATA 'MEW-EDIT-QA'
+          $exe = Join-Path $target 'MEW EDIT.exe'
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
+          $rules = @()
+          try {
+            foreach ($program in @($file, $exe)) {
+              $rules += New-NetFirewallRule -DisplayName "MEW stock QA isolated process" -Direction Outbound -Action Block -Program $program -Profile Any
+            }
+            $install = Start-Process -FilePath $file -ArgumentList @('/S', "/D=$target") -PassThru -Wait
+            if ($install.ExitCode -ne 0) { throw "NSIS exit $($install.ExitCode)" }
+            if (-not (Test-Path -LiteralPath $exe)) { throw 'Installed executable missing from isolated destination.' }
+            $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+            if ($version -notmatch '^1\.1\.1(?:\.0)?$') { throw "Unexpected installed product version $version" }
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $target 'resources/app.asar')).Hash -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5') { throw 'Installed ASAR digest mismatch.' }
+            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows Server 2025 x64."
+            $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru
+            for ($i=0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "App exited before first window with code $($app.ExitCode)." }
+              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -match 'MEW') {
+                Write-Output 'PASS observed initial MEW EDIT window; no licence or live-service actions.'
+                return
+              }
+            }
+            throw 'No initial MEW EDIT window observed within 45 seconds.'
+          } finally {
+            Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Stop-Process -Force
+            $rules | Remove-NetFirewallRule
+          }
