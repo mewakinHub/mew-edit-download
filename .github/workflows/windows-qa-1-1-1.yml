@@ -1,11 +1,11 @@
-name: Isolated Windows installer QA
+name: Isolated Windows 11 Arm installer QA
 on:
   push:
     branches: [codex/windows-qa-1-1-1]
 permissions: {}
 jobs:
   stock-installer:
-    runs-on: windows-2025
+    runs-on: windows-11-arm
     timeout-minutes: 15
     steps:
       - name: Download exact published prerelease installer
@@ -29,6 +29,10 @@ jobs:
           $target = Join-Path $env:LOCALAPPDATA 'MEW-EDIT-QA'
           $exe = Join-Path $target 'MEW EDIT.exe'
           if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
+          $os = Get-CimInstance Win32_OperatingSystem
+          $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+          Write-Output "Host OS $($os.Caption) build $($os.BuildNumber), native architecture $arch"
+          if ($os.Caption -notmatch 'Windows 11' -or $arch -ne 'Arm64') { throw 'Expected Windows 11 Arm64 runner.' }
           $rules = @()
           try {
             foreach ($program in @($file, $exe)) {
@@ -40,7 +44,7 @@ jobs:
             $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
             if ($version -notmatch '^1\.1\.1(?:\.0)?$') { throw "Unexpected installed product version $version" }
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $target 'resources/app.asar')).Hash -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5') { throw 'Installed ASAR digest mismatch.' }
-            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows Server 2025 x64."
+            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows 11 Arm64 under x64 emulation."
             $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru
             for ($i=0; $i -lt 45; $i++) {
               Start-Sleep -Seconds 1
