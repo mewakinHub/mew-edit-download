@@ -1,7 +1,7 @@
-name: Isolated Windows installer QA
+name: Isolated Windows GUI installer QA
 on:
   push:
-    branches: [codex/windows-qa-1-1-1]
+    branches: [codex/windows-qa-gui-1-1-1]
 permissions: {}
 jobs:
   stock-installer:
@@ -21,7 +21,7 @@ jobs:
           if ((Get-Item -LiteralPath $file).Length -ne 219414426) { throw 'Unexpected asset size.' }
           if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA') { throw 'Unexpected asset digest.' }
           Write-Output 'Exact approved installer digest and size verified.'
-      - name: Install offline in disposable runner and look for first window
+      - name: Observe non-silent setup and first window
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -34,14 +34,48 @@ jobs:
             foreach ($program in @($file, $exe)) {
               $rules += New-NetFirewallRule -DisplayName "MEW stock QA isolated process" -Direction Outbound -Action Block -Program $program -Profile Any
             }
-            $install = Start-Process -FilePath $file -ArgumentList @('/S', "/D=$target") -PassThru -Wait
+            Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+            $root = [Windows.Automation.AutomationElement]::RootElement
+            $safe = [Windows.Automation.TreeScope]::Descendants
+            $install = Start-Process -FilePath $file -ArgumentList @("/D=$target") -PassThru
+            $seen = $false
+            for ($i=0; $i -lt 360; $i++) {
+              $install.Refresh()
+              if ($install.HasExited) { break }
+              try {
+                $query = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$install.Id)
+                $window = $root.FindFirst([Windows.Automation.TreeScope]::Children,$query)
+                if ($window -and -not $window.Current.IsOffscreen) {
+                  if (-not $seen) {
+                    $seen = $true
+                    Write-Output "Observed setup window: $($window.Current.Name)"
+                  }
+                  $filter = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Button)
+                  foreach ($button in $window.FindAll($safe,$filter)) {
+                    $name = $button.Current.Name.Replace('&','').Trim()
+                    if ($button.Current.IsEnabled -and -not $button.Current.IsOffscreen -and $name -match '^(Install|Next\s*>?|Finish|Close)$') {
+                      $pattern = $null
+                      if ($button.TryGetCurrentPattern([Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)) {
+                        Write-Output "Invoked setup control: $name"
+                        $pattern.Invoke()
+                        break
+                      }
+                    }
+                  }
+                }
+              } catch [Windows.Automation.ElementNotAvailableException] {}
+              Start-Sleep -Milliseconds 200
+            }
+            if (-not $install.HasExited) { Stop-Process -Id $install.Id -Force; throw 'Timed out waiting for non-silent installer to finish.' }
+            if (-not $seen) { throw 'No observable window for non-silent NSIS in the runner desktop.' }
             if ($install.ExitCode -ne 0) { throw "NSIS exit $($install.ExitCode)" }
             if (-not (Test-Path -LiteralPath $exe)) { throw 'Installed executable missing from isolated destination.' }
             $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
             if ($version -notmatch '^1\.1\.1(?:\.0)?$') { throw "Unexpected installed product version $version" }
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $target 'resources/app.asar')).Hash -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5') { throw 'Installed ASAR digest mismatch.' }
-            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows Server 2025 x64."
-            $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru
+            Write-Output "PASS NSIS non-silent install, installed EXE version $version and exact ASAR digest on Windows Server 2025 x64."
+            $app = Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -NE 0 | Select-Object -First 1
+            if (-not $app) { $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru }
             for ($i=0; $i -lt 45; $i++) {
               Start-Sleep -Seconds 1
               $app.Refresh()
