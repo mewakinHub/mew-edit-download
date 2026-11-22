@@ -1,62 +1,76 @@
-name: Isolated Windows 11 Arm installer QA
+name: Windows 11 Edge download and SmartScreen observation
 on:
   push:
-    branches: [codex/windows-qa-1-1-1]
+    branches: [codex/windows-qa-smartscreen-1-1-1]
 permissions: {}
 jobs:
-  stock-installer:
+  edge-windows-verdict:
     runs-on: windows-11-arm
-    timeout-minutes: 15
+    timeout-minutes: 9
     steps:
-      - name: Download exact published prerelease installer
+      - name: Observe exact Edge download and normal Windows open
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
-          $url = 'https://github.com/mewakinHub/mew-edit-download/releases/download/v1.1.1/MEW-EDIT-Setup-1.1.1.exe'
-          $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/mewakinHub/mew-edit-download/releases/454466797'
-          $asset = @($release.assets | Where-Object id -eq 779155288)
-          if ($release.draft -or -not $release.prerelease -or $release.tag_name -ne 'v1.1.1' -or $asset.Count -ne 1 -or $asset[0].browser_download_url -ne $url -or $asset[0].size -ne 219414426 -or $asset[0].digest -ne 'sha256:2b6b2a186a541e4b2163ebdb3003e70c0580f0d7d8096b45340d75fd575313aa') { throw 'Unexpected prerelease metadata.' }
-          Invoke-WebRequest -Uri $url -OutFile $file
-          if ((Get-Item -LiteralPath $file).Length -ne 219414426) { throw 'Unexpected asset size.' }
-          if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA') { throw 'Unexpected asset digest.' }
-          Write-Output 'Exact approved installer digest and size verified.'
-      - name: Install offline in disposable runner and look for first window
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $file = Join-Path $env:RUNNER_TEMP 'MEW-EDIT-Setup-1.1.1.exe'
-          $target = Join-Path $env:LOCALAPPDATA 'MEW-EDIT-QA'
-          $exe = Join-Path $target 'MEW EDIT.exe'
-          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
-          $os = Get-CimInstance Win32_OperatingSystem
+          $name = 'MEW-EDIT-Setup-1.1.1.exe'
+          $digest = '2B6B2A186A541E4B2163EBDB3003E70C0580F0D7D8096B45340D75FD575313AA'
+          $url = "https://github.com/mewakinHub/mew-edit-download/releases/download/v1.1.1/$name"
+          $hostOs = Get-CimInstance Win32_OperatingSystem
           $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-          Write-Output "Host OS $($os.Caption) build $($os.BuildNumber), native architecture $arch"
-          if ($os.Caption -notmatch 'Windows 11' -or $arch -ne 'Arm64') { throw 'Expected Windows 11 Arm64 runner.' }
+          if ($hostOs.Caption -notmatch 'Windows 11' -or $arch -ne 'Arm64') { throw 'Unexpected runner OS or architecture.' }
+          Write-Output "Windows 11 build $($hostOs.BuildNumber), native $arch; x64 EXE test."
+          $edge = Join-Path ${env:ProgramFiles(x86)} 'Microsoft/Edge/Application/msedge.exe'
+          if (-not (Test-Path $edge)) { $edge = Join-Path $env:ProgramFiles 'Microsoft/Edge/Application/msedge.exe' }
+          if (-not (Test-Path $edge)) { throw 'Stock Edge executable unavailable.' }
+          $shell = New-Object -ComObject Shell.Application
+          $downloads = $shell.NameSpace('shell:Downloads').Self.Path
+          $file = Join-Path $downloads $name
+          if (Test-Path $file) { throw 'Download path is not empty.' }
+          $edgeProfile = Join-Path $env:RUNNER_TEMP 'mew-edge-profile'
+          Start-Process -FilePath $edge -ArgumentList @("--user-data-dir=`"$edgeProfile`"", '--no-first-run', $url)
+          for ($i=0; $i -lt 180 -and -not (Test-Path $file); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $file)) { throw 'No completed exact Edge download; no warning bypass or alternative downloader attempted.' }
+          if ((Get-Item $file).Length -ne 219414426 -or (Get-FileHash $file).Hash -ne $digest) { throw 'Unexpected exact file bytes.' }
+          $motw = Get-Content -LiteralPath $file -Stream Zone.Identifier -Raw
+          if ($motw -notmatch '(?m)^ZoneId=3\s*$') { throw 'Download does not carry Internet-zone Mark-of-the-Web.' }
+          Write-Output 'PASS Edge download; exact SHA-256 and Zone.Identifier ZoneId=3.'
+          if (@(Get-NetFirewallProfile | Where-Object { -not $_.Enabled }).Count) { throw 'Firewall profiles are not enabled.' }
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+          $uia = [Windows.Automation.AutomationElement]::RootElement
           $rules = @()
           try {
-            foreach ($program in @($file, $exe)) {
-              $rules += New-NetFirewallRule -DisplayName "MEW stock QA isolated process" -Direction Outbound -Action Block -Program $program -Profile Any
+            foreach ($program in @($file, (Join-Path $env:LOCALAPPDATA 'Programs/MEW EDIT/MEW EDIT.exe'), (Join-Path $env:LOCALAPPDATA 'Programs/mew-edit/MEW EDIT.exe'))) {
+              $rules += New-NetFirewallRule -DisplayName 'MEW QA egress block' -Direction Outbound -Action Block -Program $program -Profile Any
             }
-            $install = Start-Process -FilePath $file -ArgumentList @('/S', "/D=$target") -PassThru -Wait
-            if ($install.ExitCode -ne 0) { throw "NSIS exit $($install.ExitCode)" }
-            if (-not (Test-Path -LiteralPath $exe)) { throw 'Installed executable missing from isolated destination.' }
-            $version = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
-            if ($version -notmatch '^1\.1\.1(?:\.0)?$') { throw "Unexpected installed product version $version" }
-            if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $target 'resources/app.asar')).Hash -ne '8BDFE6A50DCB569A72D9AA5C4E21B1D138297E2BFD0C1A4DDC38231591718CE5') { throw 'Installed ASAR digest mismatch.' }
-            Write-Output "PASS NSIS silent install, installed EXE version $version and exact ASAR digest on Windows 11 Arm64 under x64 emulation."
-            $app = Start-Process -FilePath $exe -ArgumentList '--disable-background-networking','--disable-component-update' -PassThru
-            for ($i=0; $i -lt 45; $i++) {
-              Start-Sleep -Seconds 1
-              $app.Refresh()
-              if ($app.HasExited) { throw "App exited before first window with code $($app.ExitCode)." }
-              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -match 'MEW') {
-                Write-Output 'PASS observed initial MEW EDIT window; no licence or live-service actions.'
-                return
+            try { Start-Process -FilePath $file -Verb Open }
+            catch { Write-Output "Windows refused the normal Open request (HRESULT $($_.Exception.HResult)); observing any remaining dialog." }
+            $mark = [Windows.Automation.PropertyCondition]::new([Windows.Automation.AutomationElement]::ControlTypeProperty,[Windows.Automation.ControlType]::Text)
+            for ($i=0; $i -lt 80; $i++) {
+              foreach ($window in $uia.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)) {
+                try {
+                  $title = $window.Current.Name
+                  if ($window.Current.IsOffscreen) { continue }
+                  if ($title -match 'SmartScreen|Windows protected your PC') {
+                    Write-Output 'OBSERVED Windows SmartScreen prompt. No controls invoked.'
+                    return
+                  }
+                  if ($title -match '^MEW EDIT(?: Setup)?\s*$') {
+                    Write-Output "OBSERVED $title after normal Windows Open; no SmartScreen prompt was observed."
+                    return
+                  }
+                  if ($title -match 'Microsoft account|Downloads|Edge|Explorer|Windows PowerShell') { continue }
+                  foreach ($label in $window.FindAll([Windows.Automation.TreeScope]::Descendants,$mark)) {
+                    if ($label.Current.Name -match 'Windows protected your PC|Microsoft Defender SmartScreen|SmartScreen can.t be reached') {
+                      Write-Output 'OBSERVED Windows SmartScreen verdict dialog. No controls invoked.'
+                      return
+                    }
+                  }
+                } catch [Windows.Automation.ElementNotAvailableException] {}
               }
+              Start-Sleep -Milliseconds 500
             }
-            throw 'No initial MEW EDIT window observed within 45 seconds.'
+            throw 'No observable Windows stock-open verdict (neither SmartScreen nor MEW setup window).'
           } finally {
-            Get-Process 'MEW EDIT' -ErrorAction SilentlyContinue | Stop-Process -Force
+            Get-Process 'MEW EDIT','MEW-EDIT-Setup-1.1.1' -ErrorAction SilentlyContinue | Stop-Process -Force
             $rules | Remove-NetFirewallRule
           }
